@@ -1,0 +1,304 @@
+---
+title: "DiffBind_for_ATACseq"
+author: "Maya Emmons-Bell"
+date: "3/30/2022"
+output: html_document
+---
+
+This code utilizes the DiffBind and ChIPseeker packages to analyze bulk ATACseq data, from differential peak analysis to pathway analysis. 
+The project goal was to investigate shared epigenetic modules between regenerating tissues and growing tumors.
+Raw fastq files from ATACseq experiments collected from melanoma tumors, and regenerating tailfin tissue were obtained from:
+- (melanoma datasets)
+- (regenerating datasets)
+A custom processing pipeline, consisting of QC, read trimming, alignment, and peak calling, was run. 
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+load libraries
+```{r setup, include=FALSE}
+library(RSQLite)
+library(DiffBind)
+library(tidyverse)
+library(ChIPpeakAnno)
+library(org.Dr.eg.db)
+library(biomaRt)
+library(GenomicFeatures)
+library(GenomicRanges)
+library(ChIPseeker)
+library(clusterProfiler)
+library(diffloop)
+library(enrichplot)
+library(OrganismDbi)
+library(ggnewscale)
+library(gt)
+library(tidyverse)
+library(glue)
+library(compEpiTools)
+library(BSgenome.Drerio.UCSC.danRer11)
+library(ggplot2)
+library(ggridges)
+library(rWikiPathways)
+```
+
+Load contrasts and pathways to peaksets
+```{r}
+setwd("/Users/mayaemmons-bell/Desktop/RegenMelATAC")
+samples <- read.csv("samplesheet.csv")
+```
+
+Use DiffBind to read in peak sets, set up contrasts, make count matrix, and run differential analysis 
+```{r}
+
+dbObj <- dba(sampleSheet = samples)
+olap.rate <- dba.overlap(dbObj, mode=DBA_OLAP_RATE)
+plot(olap.rate, xlab="Overlapping samples", ylab="Overlapping peaks", type="b")
+
+#set up masks based on condition, use only consensus peaksets for downstream analysis
+#in this case, I'm using peaks that show up in 2/3 of samples for each condition 
+dbObj_consensus <- dba.peakset(dbObj, consensus = DBA_CONDITION, minOverlap = 0.66)
+dbObj_consensus <- dba(dbObj_consensus, mask = dbObj_consensus$masks$Consensus, minOverlap = 1)
+consensus_peaks <- dba.peakset(dbObj_consensus, bRetrieve = TRUE)
+
+#compute count matrix (this takes a long time)
+dbObj_dba.count <- dba.count(dbObj, peaks = consensus_peaks, bParallel = FALSE)
+
+#visualize overlap of peaks broken down by condition
+cons.ol <- dba.plotVenn(dbObj_consensus, mask = dbObj_consensus$masks$Consensus)
+dba.show(dbObj_dba.contrast, bContrast=T)
+
+#set up contrasts (here, by condition)
+dbObj_dba.contrast <- dba.contrast(dbObj_dba.count, categories = DBA_CONDITION)
+
+#perform differential analysis
+dbObj_dba.analyze <- dba.analyze(dbObj_dba.contrast)
+
+#use MA plots to visualize spread of differential peaks by contrast
+#this shows that most consensus differential peaks are between uninjured -> regenerating conditions
+#more peaks in melanoma than regenerating datasets, generally (consistant w literature)
+dba.plotMA(dbObj_dba.analyze, contrast = 3)
+
+#capture differentially accessible peaks
+dbObj_DA <- dba.report(dbObj_dba.analyze)
+
+#run PCA for all peaks in all samples
+dba.plotPCA(dbObj_dba.analyze, label=DBA_CONDITION, components=1:2)
+
+#produce heatmaps for each contrast (change contrast # to generate three plots)
+hmap<-colorRampPalette(c("red", "black", "blue")) (n=13)
+readscores<- dba.plotHeatmap(dbObj_dba.analyze, contrast =3, correlations = FALSE, 
+                             scale="row", colScheme = hmap)
+plot(dbObj_dba.analyze)
+dba.show(dbObj_dba.analyze,bContrasts=TRUE)
+
+#visualize the balance between gained and lost peaks
+sum(dbObj_DA$Fold>0)
+#34653 gained peaks
+sum(dbObj_DA$Fold<0)
+#8810 lost peaks 
+
+#find overlap peaks by consensus, make lists of peaks unique to each condition
+#as a sanity check you can reference these results against the venn diagram numbers (they are the same)
+overlap.Peaks <- dba.overlap(dbObj_consensus, dbObj_consensus$masks$Consensus)
+mel_sites <- overlap.Peaks$onlyA
+regend1_sites <- overlap.Peaks$onlyB
+uninjured_sites <- overlap.Peaks$onlyC
+regend4_sites <- overlap.Peaks$onlyD
+
+#generate peaksets unique to each combination of conditions
+#I was interested in this for my specific inquiry, may not apply to every experiment
+only_mel_regend1 <- overlap.Peaks$AandB
+only_mel_uninjured <- overlap.Peaks$AandC
+only_regen_uninjured <- overlap.Peaks$notA
+only_mel_regend4 <- overlap.Peaks$AandD
+only_regend1_regend4 <- overlap.Peaks$BandD
+
+#make a fasta file of peaks shared between only melanoma and regenerating samples for motif analysis 
+only_mel_regen_fasta <- GR2fasta(GR = only_mel_regen, org = BSgenome.Drerio.UCSC.danRer11, fastaFile = 'only_mel_regen_fasta.fasta')
+
+#generate reports for all sites with differential occupancy stats for each contrast
+dba.rep.MelRegen <- dba.report(dbObj_dba.analyze, contrast=1, bCalled = TRUE, th=1)
+dba.rep.MelUninjured <- dba.report(dbObj_dba.analyze, contrast=2, bCalled = TRUE, th=1)
+dba.rep.RegenUninjured <- dba.report(dbObj_dba.analyze, contrast=3, bCalled = TRUE, th=1)
+dba.rep.MelRegend4 <- dba.report(dbObj_dba.analyze, contrast=3, bCalled = TRUE, th=1)
+```
+
+Build zebrafish OrgDb and TxDb for downstream analysis
+```{r}
+#get annotated zfish genome
+listMarts()
+head(listDatasets(useMart("ensembl")), 3)
+listAttributes(zfish_anno)
+zfish_anno <- useMart("ensembl", dataset = "drerio_gene_ensembl")
+props = c("ensembl_gene_id", "ensembl_transcript_id", "chromosome_name", 
+          "start_position", "end_position", "strand", "external_gene_name")
+genes <- getBM(attributes=props, mart=zfish_anno)
+
+#build TxDb
+zfish_anno <- makeTxDbFromBiomart(biomart = "ensembl",
+                                         dataset = "drerio_gene_ensembl")
+
+#convert TxDb to GRanges object
+zfish_anno_GRanges <- toGRanges(zfish_anno)
+```
+
+Annotate peaks with CHIPseeker
+```{r}
+#troubleshooting a dataset-specific issue: 
+#in order for the annotatePeak function to work, the chromosome names have to match 
+#between the peak set and the reference genome. 
+#check this, and if they don't, you'll need to rename them (how you do this will depend on how chroms are named)
+
+#rename chromosome names (starting with peaks unique to melanoma datasest)
+newnames <- paste0(c("1","2","3","4", "5","6","7", "8","9","10","11","12","13","14","15","16","17","18","19","20","21","22","23","24","25"))
+mel_sites <- renameSeqlevels(mel_sites,newnames)
+
+#annotate peaks, and plot distribution of peak locations
+mel_sites_anno <- annotatePeak(mel_sites, TxDb=zfish_anno_GRange, annoDb = "org.Dr.eg.db")
+plotAnnoPie(mel_sites_anno, cex = 0.9)
+
+regen_sites <- renameSeqlevels(regen_sites,newnames)
+regen_sites_anno <- annotatePeak(regen_sites, TxDb=zfish_anno_GRange, annoDb = "org.Dr.eg.db")
+plotAnnoPie(regen_sites_anno, cex = 0.9)
+
+uninjured_sites <- renameSeqlevels(uninjured_sites,newnames)
+uninjured_sites_anno <- annotatePeak(uninjured_sites, TxDb=zfish_anno_GRange, annoDb = "org.Dr.eg.db")
+plotAnnoPie(uninjured_sites_anno, cex = 0.9)
+
+regend4_sites <- renameSeqlevels(regend4_sites,newnames)
+regend4_sites_anno <- annotatePeak(regend4_sites, TxDb=zfish_anno_GRange, annoDb = "org.Dr.eg.db")
+plotAnnoPie(regend4_sites_anno, cex = 0.9)
+
+#and now on pairwise combo peaksets 
+only_mel_regen_sites <- renameSeqlevels(only_mel_regen,newnames, cex = 0.9)
+only_mel_regen_sites_anno <- annotatePeak(only_mel_regen_sites, TxDb=zfish_anno_GRange, annoDb = "org.Dr.eg.db")
+plotAnnoPie(only_mel_regen_sites_anno, cex = 0.9)
+
+only_mel_uninjured_sites <- renameSeqlevels(only_mel_uninjured,newnames)
+only_mel_uninjured_sites_anno <- annotatePeak(only_mel_uninjured_sites, TxDb=zfish_anno_GRange, annoDb = "org.Dr.eg.db")
+plotAnnoPie(only_mel_uninjured_sites_anno, cex = 0.9)
+
+only_regen_uninjured_sites <- renameSeqlevels(only_regen_uninjured,newnames)
+only_regen_uninjured_sites_anno <- annotatePeak(only_regen_uninjured_sites, TxDb=zfish_anno_GRange, annoDb = "org.Dr.eg.db")
+plotAnnoPie(only_regen_uninjured_sites_anno, cex = 0.9)
+
+only_mel_regend4_sites <- renameSeqlevels(only_mel_regend4,newnames)
+only_mel_regend4_sites_anno <- annotatePeak(only_mel_regend4_sites, TxDb=zfish_anno_GRange, annoDb = "org.Dr.eg.db")
+plotAnnoPie(only_mel_regend4_sites_anno, cex = 0.9)
+
+only_mel_regend4_sites_anno <- as.GRanges(only_mel_regend4_sites_anno)
+only_mel_regend4_intergenic <- only_mel_regend4_sites_anno[only_mel_regend4_sites_anno$annotation == "Distal Intergenic",]
+
+```
+
+annotate peaks in transcriptional start sites (TSS; most likely to reflect open promoters), 
+or distal intergenic regions (most likely to reflect open enhancers)
+```{r}
+#workflow is the same for both TSS and DI peaks, comment out the code you don't need
+
+#this requires GRanges object
+Mel_Regen_GR_Anno <- as.GRanges(Mel_Regen_Anno)
+#for TSS peaks 
+Mel_Regen_TSS <- Mel_Regen_GR_Anno[abs(Mel_Regen_GR_Anno$distanceToTSS) < 500]
+#for distal intergenic peaks
+Mel_Regen_Intergenic <- Mel_Regen_GR_Anno[Mel_Regen_GR_Anno$annotation == "Distal Intergenic",]
+#take a look at top genes
+Mel_Regen_TSS[1:20,]
+Mel_Regen_TSS_topdifgenes <- Mel_Regen_TSS$SYMBOL
+#explore genes associated with most differentially accessible TSS peaks in mel v. regen
+head(Mel_Regen_TSS_topdifgenes, n=20)
+tail(Mel_Regen_TSS_topdifgenes, n= 20)
+
+#repeat for other samples
+Mel_Uninjured_GR_Anno <- as.GRanges(Mel_Uninjured_Anno)
+Mel_Uninjured_TSS <- Mel_Uninjured_GR_Anno[abs(Mel_Uninjured_GR_Anno$distanceToTSS) < 500]
+Mel_Uninjured_Intergenic <- Mel_Uninjured_GR_Anno[Mel_Uninjured_GR_Anno$annotation == "Distal Intergenic",]
+Mel_Uninjured_TSS[1,]
+Mel_Uninjured_topdifgenes <- Mel_Uninjured_TSS$SYMBOL
+head(Mel_Uninjured_topdifgenes, n=20)
+tail(Mel_Uninjured_topdifgenes, n= 20)
+
+Regen_Uninjured_GR_Anno <- as.GRanges(Regen_Uninjured_Anno)
+Regen_Uninjured_TSS <- Regen_Uninjured_GR_Anno[abs(Regen_Uninjured_GR_Anno$distanceToTSS) < 500]
+Regen_Uninjured_Intergenic <- Regen_Uninjured_GR_Anno[Regen_Uninjured_GR_Anno$annotation == "Distal Intergenic",]
+Regen_Uninjured_TSS[1,]
+Regen_Uninjured_topdifgenes <- Regen_Uninjured_TSS$SYMBOL
+head(Regen_Uninjured_topdifgenes, n=20)
+tail(Regen_Uninjured_topdifgenes, n= 20)
+
+#pull out fold changes and gene names, if that's of interest (example here is shared DI peaks between melanoma and regen)
+Mel_Regen_Intergenic_topdifgenes <- Mel_Regen_Intergenic$Fold
+names(Mel_Regen_Intergenic_topdifgenes) <- Mel_Regen_Intergenic$SYMBOL
+Mel_Regen_Intergenic_topdifgenes <- na.omit(Mel_Regen_Intergenic_topdifgenes)
+Mel_Regen_Intergenic_topdifgenes = sort(Mel_Regen_Intergenic_topdifgenes, decreasing=TRUE)
+
+#this is a good point for a sanity check - ensure the genes this analysis produces make sense given sample conditions (in this case, they do)
+
+```
+
+
+GO analysis to identify biological processes and pathways associated with peaksets of interest
+```{r}
+#you can (and should!) do this for both TSS and intergenic peaks - for brevity I'm just including TSS code, but the structure of the analysis is the same for both peak sets.
+
+#extract unique names of genes with peaks in TSS by subsetting annotated GRanges object and retrieving gene names from geneID column
+#you can relax definition of promoter here ("<=1kb"), or keep it as above (keeping it as above for now)
+#MelRegen_annotatedPeaks_1kb_TSS <- Mel_Regen_GR_Anno[Mel_Regen_GR_Anno$annotation == "Promoter (<=1kb)",]
+MelRegen_genesWithPeaksInTSS <- unique(Mel_Regen_TSS$geneId)
+MelRegen_genesWithPeaksInTSS[1:10]
+
+#get ordered list for gsea
+mel_regen_gsea <- Mel_Regen_TSS$Fold
+names(mel_regen_gsea) <- Mel_Regen_TSS$ENTREZID
+mel_regen_gsea <- na.omit(mel_regen_gsea)
+mel_regen_gsea = sort(mel_regen_gsea, decreasing=TRUE)
+
+#extract all  genes in zfish txdb, translate them into entrezID so that they match genome, select just the entrezID column so that it's a character vector
+allGeneGR <- genes(zfish_anno_GRange)
+allGeneIDs <- allGeneGR$gene_id
+allGeneIDs_translated <- bitr(allGeneIDs, fromType = "ENSEMBL", toType = c("SYMBOL", "GO", "ENTREZID"), OrgDb = org.Dr.eg.db)
+allGeneIDs_translated <- allGeneIDs_translated[,6]
+
+#enrichGO doesn't like ensemblIDs for some reason (prob bc they don't match the geneIDs object I just made), so I translated all ensemblIDs using bitr()
+MelRegen_genesWithPeaksInTSS_ids <- bitr(MelRegen_genesWithPeaksInTSS, fromType = "ENSEMBL", 
+                                         toType = c("SYMBOL", "GO", "ENTREZID"), OrgDb = org.Dr.eg.db)
+MelRegen_genesWithPeaksInTSS_EntrezIDs <- MelRegen_genesWithPeaksInTSS_ids[,6]
+
+#run GO analysis and plot
+GO_result <- enrichGO(gene=MelRegen_genesWithPeaksInTSS_EntrezIDs, keyType = "ENTREZID", universe = allGeneIDs_translated, 
+                      OrgDb = org.Dr.eg.db, ont="BP", pAdjustMethod="none", pvalueCutoff=1, qvalueCutoff=1)
+GO_result_df <- data.frame(GO_result)
+GO_result_df[1:10,]
+
+#plot
+GO_result_plot <- pairwise_termsim(GO_result)
+emapplot(GO_result_plot, showCategory = 20)
+
+#repeat with peaksets of interest! 
+#also a good idea to save bed files for IGV browser
+```
+
+GSEA analysis 
+```{r}
+#get ordered peak list for gsea, in decreasing order
+mel_regen_gsea <- Mel_Regen_TSS$Fold
+names(mel_regen_gsea) <- Mel_Regen_TSS$ENTREZID
+mel_regen_gsea <- na.omit(mel_regen_gsea)
+mel_regen_gsea = sort(mel_regen_gsea, decreasing=TRUE)
+
+mel_regen_gsea_result <- gseGO(mel_regen_gsea, ont="BP", keyType = "ENTREZID",
+                 minGSSize = 3, maxGSSize = 800, pvalueCutoff = 0.05, verbose = TRUE,
+                 OrgDb = org.Dr.eg.db, pAdjustMethod = "none")
+
+#make dotplot of results
+dotplot(mel_regen_gsea_result, showCategory=10, split=".sign") + facet_grid(.~.sign)
+mel_regen_gsea_result_plot <- pairwise_termsim(mel_regen_gsea_result)
+emapplot(mel_regen_gsea_result_plot, showCategory = 20, cex_label_category = 0.7)
+ridgeplot(mel_regen_gsea_result_plot) + labs(x="enrichment distribution")
+gseaplot(mel_regen_gsea_result, by ="all", title=mel_regen_gsea_result$Description[3], geneSetID = 3)
+
+#repeat with peaksets of interest!
+```
+
