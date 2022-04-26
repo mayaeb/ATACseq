@@ -1,5 +1,5 @@
 # ATACseq
-Scripts to analyze published zebrafish bulk ATACseq datasets
+Scripts to analyze published zebrafish bulk ATACseq data
 
 
 
